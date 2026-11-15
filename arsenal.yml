@@ -1,0 +1,1197 @@
+name: Build Arsenal
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/arsenal.yml'
+      - '*.mcaddon'
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Build resource pack from .mcaddon
+        run: |
+          set -e
+          ADDON=$(ls -1 *.mcaddon 2>/dev/null | head -n1 || true)
+          if [ -z "$ADDON" ]; then
+            echo "::error::Put Arsenal_V1_0_1.mcaddon into the repository root (next to .github)"
+            exit 1
+          fi
+          echo "Using addon: $ADDON"
+          rm -rf addon && mkdir addon
+          unzip -q "$ADDON" -d addon
+          python3 - <<'PY'
+          import json
+          root = 'addon/ArsenalRP'
+          def load(p):
+              with open(p, encoding='utf-8-sig') as f:
+                  return json.load(f)
+          def save(p, d):
+              with open(p, 'w', encoding='utf-8') as f:
+                  json.dump(d, f, ensure_ascii=False, indent=2)
+          tp = root + '/textures/item_texture.json'
+          d = load(tp)
+          for k in ['revolver', 'mac10', 'thompson', 'ump', 'rifle_m4a1', 'awm']:
+              d['texture_data']['arsenal:' + k] = {'textures': 'textures/arsenal/' + k}
+          save(tp, d)
+          mp = root + '/manifest.json'
+          m = load(mp)
+          m.pop('dependencies', None)
+          save(mp, m)
+          PY
+          mkdir -p ArsenalPlugin/src/main/resources
+          (cd addon/ArsenalRP && zip -qr ../../ArsenalPlugin/src/main/resources/ArsenalRP.zip .)
+          mkdir -p out
+          cp ArsenalPlugin/src/main/resources/ArsenalRP.zip out/ArsenalRP.zip
+
+      - name: Create project
+        run: |
+          set -e
+          P=ArsenalPlugin
+          J=$P/src/main/java/arsenal
+          mkdir -p $J $P/src/main/resources
+
+          cat > $P/pom.xml <<'ARS_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>arsenal</groupId>
+            <artifactId>ArsenalPlugin</artifactId>
+            <version>1.0.0</version>
+            <packaging>jar</packaging>
+            <properties>
+              <maven.compiler.source>17</maven.compiler.source>
+              <maven.compiler.target>17</maven.compiler.target>
+              <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+            </properties>
+            <repositories>
+              <repository>
+                <id>lanink</id>
+                <url>https://repo.lanink.cn/repository/maven-public/</url>
+              </repository>
+            </repositories>
+            <dependencies>
+              <dependency>
+                <groupId>cn.nukkit</groupId>
+                <artifactId>Nukkit</artifactId>
+                <version>MOT-SNAPSHOT</version>
+                <scope>provided</scope>
+              </dependency>
+            </dependencies>
+            <build>
+              <finalName>Arsenal</finalName>
+            </build>
+          </project>
+          ARS_EOF
+
+          cat > $P/src/main/resources/plugin.yml <<'ARS_EOF'
+          name: Arsenal
+          main: arsenal.ArsenalPlugin
+          version: "1.0.0"
+          api: ["1.0.0"]
+          author: Eclips
+          description: Guns from the Arsenal add-on
+          commands:
+            arsenal:
+              description: "Give guns and ammo"
+              usage: "/arsenal give <item> [count] [player]"
+              permission: arsenal.give
+          permissions:
+            arsenal.give:
+              default: op
+          ARS_EOF
+
+          cat > $P/src/main/resources/config.yml <<'ARS_EOF'
+          # Max shot distance in blocks
+          range: 120
+          # Hold window (ticks). While right-clicks keep arriving more often than this, the gun keeps firing
+          hold_window_ticks: 6
+          # EXPERIMENTAL: adds use_duration to the gun item definition (needed for client shoot animation).
+          # In this mode firing continues until the client sends "release". Test it before using on a live server.
+          use_duration_patch: false
+          camera_shake: true
+          msg_ammo: "&eAmmo: &f%ammo% / %max%"
+          msg_no_ammo: "&cOut of ammo"
+          msg_reloading: "&7Reloading..."
+          msg_lore_ammo: "&7Ammo: %ammo% / %max%"
+          ARS_EOF
+
+          cat > $J/GunType.java <<'ARS_EOF'
+          package arsenal;
+
+          public enum GunType {
+              REVOLVER("revolver", "Revolver", "revolver_fire", "revolver_reload", "ammo_pistol", 8, 11, 15, 6, 2.93, 0.13f, 0.10f),
+              MAC10("mac10", "MAC-10", "mac10_fire", "mac10_reload", "ammo_assault_rifle", 5, 7, 2, 32, 1.76, 0.06f, 0.04f),
+              THOMPSON("thompson", "Thompson SMG", "thompson_fire", "thompson_reload", "ammo_assault_rifle", 6, 8, 2, 30, 1.61, 0.09f, 0.07f),
+              UMP("ump", "UMP-45", "ump_fire", "ump_reload", "ammo_assault_rifle", 7, 9, 4, 30, 1.76, 0.07f, 0.05f),
+              M4A1("rifle_m4a1", "M4A1", "m4a1_fire", "m4a1_reload", "ammo_assault_rifle", 8, 10, 3, 30, 1.76, 0.10f, 0.08f),
+              AWM("awm", "AWM Sniper Rifle", "awm_fire", "awm_reload", "ammo_rifle", 20, 24, 30, 7, 2.01, 0.18f, 0.15f);
+
+              public final String key;
+              public final String display;
+              public final String fireSound;
+              public final String reloadSound;
+              public final String ammoKey;
+              public final int damage;
+              public final int damageAds;
+              public final int rate;
+              public final int mag;
+              public final double reloadSec;
+              public final float shake;
+              public final float shakeAds;
+
+              GunType(String key, String display, String fireSound, String reloadSound, String ammoKey,
+                      int damage, int damageAds, int rate, int mag, double reloadSec, float shake, float shakeAds) {
+                  this.key = key;
+                  this.display = display;
+                  this.fireSound = fireSound;
+                  this.reloadSound = reloadSound;
+                  this.ammoKey = ammoKey;
+                  this.damage = damage;
+                  this.damageAds = damageAds;
+                  this.rate = rate;
+                  this.mag = mag;
+                  this.reloadSec = reloadSec;
+                  this.shake = shake;
+                  this.shakeAds = shakeAds;
+              }
+
+              public static GunType byKey(String k) {
+                  if (k == null) {
+                      return null;
+                  }
+                  if (k.equals("m4a1")) {
+                      k = "rifle_m4a1";
+                  }
+                  for (GunType t : values()) {
+                      if (t.key.equals(k)) {
+                          return t;
+                      }
+                  }
+                  return null;
+              }
+          }
+          ARS_EOF
+
+          cat > $J/GunItem.java <<'ARS_EOF'
+          package arsenal;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.item.customitem.CustomItemDefinition;
+          import cn.nukkit.item.customitem.ItemCustom;
+          import cn.nukkit.nbt.tag.CompoundTag;
+          import cn.nukkit.network.protocol.types.inventory.creative.CreativeItemCategory;
+
+          import java.lang.reflect.Method;
+          import java.util.function.Consumer;
+
+          public abstract class GunItem extends ItemCustom {
+
+              private final GunType type;
+              private final boolean empty;
+
+              protected GunItem(String id, String name, String tex, GunType type, boolean empty) {
+                  super(id, name, tex);
+                  this.type = type;
+                  this.empty = empty;
+              }
+
+              public GunType type() {
+                  return type;
+              }
+
+              public boolean empty() {
+                  return empty;
+              }
+
+              public String key() {
+                  return type.key + (empty ? "_empty" : "");
+              }
+
+              @Override
+              public int getMaxStackSize() {
+                  return 1;
+              }
+
+              @Override
+              public boolean onRelease(Player player, int ticksUsed) {
+                  try {
+                      ArsenalPlugin.I.release(player);
+                  } catch (Throwable ignored) {
+                  }
+                  return false;
+              }
+
+              private static void patch(CompoundTag nbt) {
+                  CompoundTag comps = nbt.getCompound("components");
+                  CompoundTag props = comps.getCompound("item_properties");
+                  props.putInt("use_duration", 1000);
+                  comps.putCompound("item_properties", props);
+                  CompoundTag um = new CompoundTag();
+                  um.putFloat("use_duration", 1000f);
+                  um.putFloat("movement_modifier", 1f);
+                  comps.putCompound("minecraft:use_modifiers", um);
+                  nbt.putCompound("components", comps);
+              }
+
+              @Override
+              public CustomItemDefinition getDefinition() {
+                  CustomItemDefinition.SimpleBuilder b = CustomItemDefinition
+                          .simpleBuilder(this, CreativeItemCategory.EQUIPMENT)
+                          .allowOffHand(false);
+                  if (ArsenalPlugin.usePatch) {
+                      try {
+                          Method m = b.getClass().getMethod("customBuild", Consumer.class);
+                          Consumer<CompoundTag> c = GunItem::patch;
+                          return (CustomItemDefinition) m.invoke(b, c);
+                      } catch (Throwable t) {
+                          ArsenalPlugin.I.getLogger().warning("[Arsenal] use_duration_patch failed, using plain definition: " + t);
+                      }
+                  }
+                  return b.build();
+              }
+          }
+          ARS_EOF
+
+          cat > $J/AmmoItem.java <<'ARS_EOF'
+          package arsenal;
+
+          import cn.nukkit.item.customitem.CustomItemDefinition;
+          import cn.nukkit.item.customitem.ItemCustom;
+          import cn.nukkit.network.protocol.types.inventory.creative.CreativeItemCategory;
+
+          public abstract class AmmoItem extends ItemCustom {
+
+              private final String key;
+
+              protected AmmoItem(String id, String name, String tex, String key) {
+                  super(id, name, tex);
+                  this.key = key;
+              }
+
+              public String key() {
+                  return key;
+              }
+
+              @Override
+              public int getMaxStackSize() {
+                  return 32;
+              }
+
+              @Override
+              public CustomItemDefinition getDefinition() {
+                  return CustomItemDefinition.simpleBuilder(this, CreativeItemCategory.EQUIPMENT)
+                          .allowOffHand(true)
+                          .build();
+              }
+          }
+          ARS_EOF
+
+          # ---- generated item classes: 6 guns x (loaded, empty) + 3 ammo ----
+          for spec in "revolver|Revolver" "mac10|MAC-10" "thompson|Thompson SMG" "ump|UMP-45" "rifle_m4a1|M4A1" "awm|AWM Sniper Rifle"; do
+            K="${spec%%|*}"
+            N="${spec#*|}"
+            case "$K" in
+              revolver) E=REVOLVER ;;
+              mac10) E=MAC10 ;;
+              thompson) E=THOMPSON ;;
+              ump) E=UMP ;;
+              rifle_m4a1) E=M4A1 ;;
+              awm) E=AWM ;;
+            esac
+            cat > $J/Item_${K}.java <<JAVA
+          package arsenal;
+
+          public class Item_${K} extends GunItem {
+              public Item_${K}() {
+                  super("arsenal:${K}", "${N}", "arsenal:${K}", GunType.${E}, false);
+              }
+          }
+          JAVA
+            cat > $J/Item_${K}_empty.java <<JAVA
+          package arsenal;
+
+          public class Item_${K}_empty extends GunItem {
+              public Item_${K}_empty() {
+                  super("arsenal:${K}_empty", "${N} (empty)", "arsenal:${K}", GunType.${E}, true);
+              }
+          }
+          JAVA
+          done
+
+          for spec in "ammo_pistol|Pistol Ammo" "ammo_assault_rifle|Assault Rifle Ammo" "ammo_rifle|Rifle Ammo"; do
+            K="${spec%%|*}"
+            N="${spec#*|}"
+            cat > $J/Item_${K}.java <<JAVA
+          package arsenal;
+
+          public class Item_${K} extends AmmoItem {
+              public Item_${K}() {
+                  super("arsenal:${K}", "${N}", "arsenal:${K}", "${K}");
+              }
+          }
+          JAVA
+          done
+
+          cat > $J/Items.java <<'ARS_EOF'
+          package arsenal;
+
+          import cn.nukkit.item.Item;
+          import cn.nukkit.nbt.tag.CompoundTag;
+
+          import java.util.ArrayList;
+          import java.util.List;
+
+          final class Items {
+
+              static final String[] GUNS = {"revolver", "mac10", "thompson", "ump", "rifle_m4a1", "awm"};
+              static final String[][] AMMO = {
+                      {"ammo_pistol", "Pistol Ammo"},
+                      {"ammo_assault_rifle", "Assault Rifle Ammo"},
+                      {"ammo_rifle", "Rifle Ammo"}
+              };
+
+              private Items() {
+              }
+
+              static List<String> allKeys() {
+                  List<String> l = new ArrayList<>();
+                  for (String g : GUNS) {
+                      l.add(g);
+                      l.add(g + "_empty");
+                  }
+                  for (String[] a : AMMO) {
+                      l.add(a[0]);
+                  }
+                  return l;
+              }
+
+              static boolean isAmmoKey(String k) {
+                  for (String[] a : AMMO) {
+                      if (a[0].equals(k)) {
+                          return true;
+                      }
+                  }
+                  return false;
+              }
+
+              static String display(String key) {
+                  for (String[] a : AMMO) {
+                      if (a[0].equals(key)) {
+                          return a[1];
+                      }
+                  }
+                  boolean empty = key.endsWith("_empty");
+                  GunType t = GunType.byKey(empty ? key.substring(0, key.length() - 6) : key);
+                  if (t == null) {
+                      return key;
+                  }
+                  return t.display + (empty ? " (empty)" : "");
+              }
+
+              static Item make(String key) {
+                  try {
+                      Item it = (Item) Class.forName("arsenal.Item_" + key).getDeclaredConstructor().newInstance();
+                      CompoundTag t = new CompoundTag();
+                      t.putString("arsenal_id", key);
+                      it.setNamedTag(t);
+                      it.setCustomName("\u00a7r\u00a7f" + display(key));
+                      return it;
+                  } catch (Throwable e) {
+                      ArsenalPlugin.I.getLogger().error("[Arsenal] cannot create item " + key + ": " + e, e);
+                      return null;
+                  }
+              }
+
+              static Item loaded(GunType t, int ammo) {
+                  Item it = make(t.key);
+                  if (it != null) {
+                      setAmmo(it, ammo, t.mag);
+                  }
+                  return it;
+              }
+
+              static String keyOf(Item it) {
+                  if (it == null) {
+                      return null;
+                  }
+                  if (it instanceof GunItem) {
+                      return ((GunItem) it).key();
+                  }
+                  if (it instanceof AmmoItem) {
+                      return ((AmmoItem) it).key();
+                  }
+                  if (it.hasCompoundTag() && it.getNamedTag().contains("arsenal_id")) {
+                      return it.getNamedTag().getString("arsenal_id");
+                  }
+                  return null;
+              }
+
+              static int getAmmo(Item it, int def) {
+                  if (it != null && it.hasCompoundTag() && it.getNamedTag().contains("arsenal_ammo")) {
+                      return it.getNamedTag().getInt("arsenal_ammo");
+                  }
+                  return def;
+              }
+
+              static void setAmmo(Item it, int ammo, int max) {
+                  CompoundTag t = it.hasCompoundTag() ? it.getNamedTag() : new CompoundTag();
+                  t.putInt("arsenal_ammo", ammo);
+                  it.setNamedTag(t);
+                  it.setLore(ArsenalPlugin.I.loreAmmo(ammo, max));
+              }
+          }
+          ARS_EOF
+
+          cat > $J/Fx.java <<'ARS_EOF'
+          package arsenal;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.level.Level;
+          import cn.nukkit.math.Vector3;
+          import cn.nukkit.network.protocol.DataPacket;
+
+          import java.lang.reflect.Field;
+
+          // Sound and camera shake go through reflection, so a field mismatch in this Nukkit-MOT build
+          // never breaks compilation: it only logs one warning at runtime.
+          final class Fx {
+
+              private static boolean soundFailed;
+              private static boolean shakeFailed;
+
+              private Fx() {
+              }
+
+              private static Object conv(Class<?> t, Object v) {
+                  if (v instanceof Number) {
+                      Number n = (Number) v;
+                      if (t == int.class) {
+                          return n.intValue();
+                      }
+                      if (t == float.class) {
+                          return n.floatValue();
+                      }
+                      if (t == double.class) {
+                          return n.doubleValue();
+                      }
+                      if (t == long.class) {
+                          return n.longValue();
+                      }
+                      if (t == byte.class) {
+                          return n.byteValue();
+                      }
+                      if (t == short.class) {
+                          return n.shortValue();
+                      }
+                  }
+                  return v;
+              }
+
+              private static DataPacket packet(String cls, Object... kv) throws Exception {
+                  Class<?> c = Class.forName(cls);
+                  Object o = c.getDeclaredConstructor().newInstance();
+                  for (int i = 0; i < kv.length; i += 2) {
+                      Field f = c.getField((String) kv[i]);
+                      f.set(o, conv(f.getType(), kv[i + 1]));
+                  }
+                  return (DataPacket) o;
+              }
+
+              /** only != null: send just to that player, otherwise to everyone within radius */
+              static void sound(Level lv, Vector3 pos, String name, double radius, Player only) {
+                  try {
+                      DataPacket pk = packet("cn.nukkit.network.protocol.PlaySoundPacket",
+                              "name", name,
+                              "x", (int) Math.floor(pos.x),
+                              "y", (int) Math.floor(pos.y),
+                              "z", (int) Math.floor(pos.z),
+                              "volume", 1f,
+                              "pitch", 1f);
+                      if (only != null) {
+                          only.dataPacket(pk);
+                          return;
+                      }
+                      double r2 = radius * radius;
+                      for (Player p : lv.getPlayers().values()) {
+                          if (p.distanceSquared(pos) <= r2) {
+                              p.dataPacket(pk);
+                          }
+                      }
+                  } catch (Throwable t) {
+                      if (!soundFailed) {
+                          soundFailed = true;
+                          ArsenalPlugin.I.getLogger().warning("[Arsenal] PlaySoundPacket failed: " + t);
+                      }
+                  }
+              }
+
+              static void shake(Player p, float intensity) {
+                  try {
+                      DataPacket pk = packet("cn.nukkit.network.protocol.CameraShakePacket",
+                              "intensity", intensity,
+                              "duration", 0.1f,
+                              "shakeType", 1,
+                              "shakeAction", 0);
+                      p.dataPacket(pk);
+                  } catch (Throwable t) {
+                      if (!shakeFailed) {
+                          shakeFailed = true;
+                          ArsenalPlugin.I.getLogger().warning("[Arsenal] CameraShakePacket failed: " + t);
+                      }
+                  }
+              }
+          }
+          ARS_EOF
+
+          cat > $J/Ballistics.java <<'ARS_EOF'
+          package arsenal;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.block.Block;
+          import cn.nukkit.entity.Entity;
+          import cn.nukkit.entity.EntityLiving;
+          import cn.nukkit.event.entity.EntityDamageByEntityEvent;
+          import cn.nukkit.event.entity.EntityDamageEvent;
+          import cn.nukkit.level.Level;
+          import cn.nukkit.level.particle.DestroyBlockParticle;
+          import cn.nukkit.math.AxisAlignedBB;
+          import cn.nukkit.math.SimpleAxisAlignedBB;
+          import cn.nukkit.math.Vector3;
+
+          final class Ballistics {
+
+              private static boolean failed;
+
+              private Ballistics() {
+              }
+
+              // slab method: distance along the ray to the box, or -1
+              private static double rayBox(Vector3 o, Vector3 d, AxisAlignedBB b, double max) {
+                  double[] oo = {o.x, o.y, o.z};
+                  double[] dd = {d.x, d.y, d.z};
+                  double[] lo = {b.getMinX(), b.getMinY(), b.getMinZ()};
+                  double[] hi = {b.getMaxX(), b.getMaxY(), b.getMaxZ()};
+                  double tmin = 0;
+                  double tmax = max;
+                  for (int i = 0; i < 3; i++) {
+                      if (Math.abs(dd[i]) < 1e-9) {
+                          if (oo[i] < lo[i] || oo[i] > hi[i]) {
+                              return -1;
+                          }
+                      } else {
+                          double t1 = (lo[i] - oo[i]) / dd[i];
+                          double t2 = (hi[i] - oo[i]) / dd[i];
+                          if (t1 > t2) {
+                              double t = t1;
+                              t1 = t2;
+                              t2 = t;
+                          }
+                          tmin = Math.max(tmin, t1);
+                          tmax = Math.min(tmax, t2);
+                          if (tmin > tmax) {
+                              return -1;
+                          }
+                      }
+                  }
+                  return tmin;
+              }
+
+              static void shoot(Player p, double damage, double range) {
+                  try {
+                      Level lv = p.getLevel();
+                      Vector3 eye = new Vector3(p.x, p.y + p.getEyeHeight(), p.z);
+                      Vector3 dir = p.getDirectionVector();
+
+                      double blockT = range;
+                      Block hitBlock = null;
+                      for (double d = 0.5; d <= range; d += 0.25) {
+                          int bx = (int) Math.floor(eye.x + dir.x * d);
+                          int by = (int) Math.floor(eye.y + dir.y * d);
+                          int bz = (int) Math.floor(eye.z + dir.z * d);
+                          Block b = lv.getBlock(bx, by, bz);
+                          if (b != null && b.isSolid()) {
+                              blockT = d;
+                              hitBlock = b;
+                              break;
+                          }
+                      }
+
+                      double ex = eye.x + dir.x * blockT;
+                      double ey = eye.y + dir.y * blockT;
+                      double ez = eye.z + dir.z * blockT;
+                      AxisAlignedBB sweep = new SimpleAxisAlignedBB(
+                              Math.min(eye.x, ex) - 1, Math.min(eye.y, ey) - 1, Math.min(eye.z, ez) - 1,
+                              Math.max(eye.x, ex) + 1, Math.max(eye.y, ey) + 1, Math.max(eye.z, ez) + 1);
+
+                      Entity victim = null;
+                      double best = blockT;
+                      for (Entity e : lv.getNearbyEntities(sweep, p)) {
+                          if (e == p || !(e instanceof EntityLiving) || !e.isAlive()) {
+                              continue;
+                          }
+                          if (e instanceof Player && ((Player) e).isSpectator()) {
+                              continue;
+                          }
+                          double t = rayBox(eye, dir, e.getBoundingBox(), best);
+                          if (t >= 0 && t < best) {
+                              best = t;
+                              victim = e;
+                          }
+                      }
+
+                      if (victim != null) {
+                          EntityDamageByEntityEvent ev = new EntityDamageByEntityEvent(
+                                  p, victim, EntityDamageEvent.DamageCause.PROJECTILE, (float) damage, 0f);
+                          victim.attack(ev);
+                      } else if (hitBlock != null) {
+                          Vector3 hit = new Vector3(eye.x + dir.x * (blockT - 0.05),
+                                  eye.y + dir.y * (blockT - 0.05),
+                                  eye.z + dir.z * (blockT - 0.05));
+                          lv.addParticle(new DestroyBlockParticle(hit, hitBlock));
+                          Fx.sound(lv, hit, "arsenal:bullet_hit", 32, null);
+                      }
+                  } catch (Throwable t) {
+                      if (!failed) {
+                          failed = true;
+                          ArsenalPlugin.I.getLogger().error("[Arsenal] shoot failed: " + t, t);
+                      }
+                  }
+              }
+          }
+          ARS_EOF
+
+          cat > $J/ArsenalPlugin.java <<'ARS_EOF'
+          package arsenal;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.command.Command;
+          import cn.nukkit.command.CommandSender;
+          import cn.nukkit.event.EventHandler;
+          import cn.nukkit.event.EventPriority;
+          import cn.nukkit.event.Listener;
+          import cn.nukkit.event.player.PlayerDeathEvent;
+          import cn.nukkit.event.player.PlayerDropItemEvent;
+          import cn.nukkit.event.player.PlayerInteractEvent;
+          import cn.nukkit.event.player.PlayerItemHeldEvent;
+          import cn.nukkit.event.player.PlayerQuitEvent;
+          import cn.nukkit.inventory.PlayerInventory;
+          import cn.nukkit.item.Item;
+          import cn.nukkit.plugin.PluginBase;
+          import cn.nukkit.potion.Effect;
+          import cn.nukkit.scheduler.Task;
+          import cn.nukkit.utils.TextFormat;
+
+          import java.io.File;
+          import java.io.InputStream;
+          import java.nio.file.Files;
+          import java.nio.file.StandardCopyOption;
+          import java.util.ArrayList;
+          import java.util.HashMap;
+          import java.util.HashSet;
+          import java.util.Map;
+          import java.util.Set;
+          import java.util.UUID;
+
+          public class ArsenalPlugin extends PluginBase implements Listener {
+
+              static ArsenalPlugin I;
+              static boolean usePatch;
+
+              private double range = 120;
+              private int holdWindow = 6;
+              private boolean shakeOn = true;
+
+              private final Map<UUID, Session> sessions = new HashMap<>();
+              private final Map<String, Integer> cooldown = new HashMap<>();
+              private final Map<UUID, Integer> reloadUntil = new HashMap<>();
+              private final Set<UUID> zoomed = new HashSet<>();
+
+              static final class Session {
+                  final Player player;
+                  final GunType type;
+                  final int slot;
+                  int ammo;
+                  int lastClick;
+                  int nextShot;
+                  boolean released;
+
+                  Session(Player player, GunType type, int slot, int ammo) {
+                      this.player = player;
+                      this.type = type;
+                      this.slot = slot;
+                      this.ammo = ammo;
+                  }
+              }
+
+              // ---------- config / messages ----------
+
+              private String msg(String key, String def) {
+                  return TextFormat.colorize('&', getConfig().getString(key, def));
+              }
+
+              private String fill(String s, int ammo, int max) {
+                  return s.replace("%ammo%", String.valueOf(ammo)).replace("%max%", String.valueOf(max));
+              }
+
+              String loreAmmo(int ammo, int max) {
+                  return fill(msg("msg_lore_ammo", "&7Ammo: %ammo% / %max%"), ammo, max);
+              }
+
+              private void bar(Player p, int ammo, int max) {
+                  p.sendActionBar(fill(msg("msg_ammo", "&eAmmo: &f%ammo% / %max%"), ammo, max));
+              }
+
+              // ---------- lifecycle ----------
+
+              private void reg(String key) {
+                  try {
+                      Class<? extends Item> c = Class.forName("arsenal.Item_" + key).asSubclass(Item.class);
+                      Item.registerCustomItem(c.asSubclass(Item.class).asSubclass(cn.nukkit.item.customitem.CustomItem.class));
+                  } catch (Throwable t) {
+                      getLogger().error("[Arsenal] cannot register item " + key + ": " + t, t);
+                  }
+              }
+
+              @Override
+              public void onLoad() {
+                  I = this;
+                  try {
+                      saveDefaultConfig();
+                      range = getConfig().getDouble("range", 120);
+                      holdWindow = getConfig().getInt("hold_window_ticks", 6);
+                      usePatch = getConfig().getBoolean("use_duration_patch", false);
+                      shakeOn = getConfig().getBoolean("camera_shake", true);
+                      for (String k : Items.allKeys()) {
+                          reg(k);
+                      }
+                  } catch (Throwable t) {
+                      getLogger().error("[Arsenal] onLoad failed: " + t, t);
+                  }
+              }
+
+              @Override
+              public void onEnable() {
+                  I = this;
+                  getServer().getPluginManager().registerEvents(this, this);
+                  installPack();
+                  getServer().getScheduler().scheduleRepeatingTask(this, new Task() {
+                      @Override
+                      public void onRun(int currentTick) {
+                          try {
+                              loop(currentTick);
+                          } catch (Throwable t) {
+                              getLogger().error("[Arsenal] loop error: " + t, t);
+                          }
+                      }
+                  }, 1);
+                  getLogger().info("[Arsenal] enabled, range=" + range + ", hold_window=" + holdWindow + ", use_duration_patch=" + usePatch);
+              }
+
+              @Override
+              public void onDisable() {
+                  for (Session s : new ArrayList<>(sessions.values())) {
+                      endSession(s, true);
+                  }
+                  for (Player p : getServer().getOnlinePlayers().values()) {
+                      if (zoomed.remove(p.getUniqueId())) {
+                          p.removeEffect(Effect.SLOWNESS);
+                      }
+                  }
+              }
+
+              // copies the resource pack from the jar into resource_packs/ (a restart is needed the first time)
+              private void installPack() {
+                  try {
+                      File dir = new File(getServer().getDataPath() + "resource_packs");
+                      if (!dir.exists()) {
+                          dir.mkdirs();
+                      }
+                      File dest = new File(dir, "ArsenalRP.zip");
+                      try (InputStream in = getResource("ArsenalRP.zip")) {
+                          if (in == null) {
+                              getLogger().warning("[Arsenal] ArsenalRP.zip is not inside the jar");
+                              return;
+                          }
+                          byte[] data = in.readAllBytes();
+                          if (!dest.exists() || dest.length() != data.length) {
+                              Files.write(dest.toPath(), data);
+                              getLogger().warning("[Arsenal] resource pack installed to resource_packs/ArsenalRP.zip - RESTART the server so clients get it");
+                          }
+                      }
+                  } catch (Throwable t) {
+                      getLogger().error("[Arsenal] cannot install resource pack: " + t, t);
+                  }
+              }
+
+              // ---------- main loop ----------
+
+              private void loop(int tick) {
+                  if (!sessions.isEmpty()) {
+                      for (Session s : new ArrayList<>(sessions.values())) {
+                          Player p = s.player;
+                          if (!p.isOnline() || !p.isAlive() || p.getInventory().getHeldItemIndex() != s.slot) {
+                              endSession(s, true);
+                              continue;
+                          }
+                          boolean held = usePatch ? !s.released : (tick - s.lastClick <= holdWindow);
+                          if (!held) {
+                              endSession(s, true);
+                              continue;
+                          }
+                          if (tick >= s.nextShot) {
+                              fire(s, tick);
+                          }
+                      }
+                  }
+                  if (tick % 5 == 0) {
+                      zoomTick();
+                  }
+              }
+
+              // AWM scope: slowness while sneaking with the loaded AWM
+              private void zoomTick() {
+                  for (Player p : getServer().getOnlinePlayers().values()) {
+                      UUID id = p.getUniqueId();
+                      String k = Items.keyOf(p.getInventory().getItemInHand());
+                      boolean want = "awm".equals(k) && p.isSneaking() && p.isAlive();
+                      boolean has = zoomed.contains(id);
+                      if (want && !has) {
+                          zoomed.add(id);
+                          p.addEffect(Effect.getEffect(Effect.SLOWNESS).setDuration(2000000).setAmplifier(7).setVisible(false));
+                      } else if (!want && has) {
+                          zoomed.remove(id);
+                          p.removeEffect(Effect.SLOWNESS);
+                      }
+                  }
+              }
+
+              // ---------- firing ----------
+
+              private String cdKey(Player p, GunType t) {
+                  return p.getUniqueId() + ":" + t.key;
+              }
+
+              private void click(Player p, GunType t, Item it, int tick) {
+                  int idx = p.getInventory().getHeldItemIndex();
+                  Session s = sessions.get(p.getUniqueId());
+                  if (s != null) {
+                      if (s.type == t && s.slot == idx) {
+                          s.lastClick = tick;
+                          return;
+                      }
+                      endSession(s, true);
+                  }
+                  Integer ru = reloadUntil.get(p.getUniqueId());
+                  if (ru != null && tick < ru) {
+                      return;
+                  }
+                  Integer cd = cooldown.get(cdKey(p, t));
+                  if (cd != null && tick < cd) {
+                      return;
+                  }
+                  int ammo = Math.min(Items.getAmmo(it, t.mag), t.mag);
+                  if (ammo <= 0) {
+                      p.getInventory().setItem(idx, Items.make(t.key + "_empty"));
+                      return;
+                  }
+                  s = new Session(p, t, idx, ammo);
+                  s.lastClick = tick;
+                  sessions.put(p.getUniqueId(), s);
+                  fire(s, tick);
+              }
+
+              private void fire(Session s, int tick) {
+                  Player p = s.player;
+                  GunType t = s.type;
+                  boolean ads = p.isSneaking();
+                  s.ammo--;
+                  s.nextShot = tick + t.rate;
+                  cooldown.put(cdKey(p, t), tick + t.rate);
+                  Fx.sound(p.getLevel(), p, "arsenal:" + t.fireSound, 48, null);
+                  if (shakeOn) {
+                      Fx.shake(p, ads ? t.shakeAds : t.shake);
+                  }
+                  Ballistics.shoot(p, ads ? t.damageAds : t.damage, range);
+                  bar(p, Math.max(s.ammo, 0), t.mag);
+                  if (s.ammo <= 0) {
+                      sessions.remove(p.getUniqueId());
+                      toEmpty(s);
+                  }
+              }
+
+              private void toEmpty(Session s) {
+                  try {
+                      PlayerInventory inv = s.player.getInventory();
+                      String k = Items.keyOf(inv.getItem(s.slot));
+                      if (s.type.key.equals(k)) {
+                          inv.setItem(s.slot, Items.make(s.type.key + "_empty"));
+                      }
+                  } catch (Throwable t) {
+                      getLogger().error("[Arsenal] toEmpty: " + t, t);
+                  }
+              }
+
+              private void persist(Session s) {
+                  try {
+                      PlayerInventory inv = s.player.getInventory();
+                      Item cur = inv.getItem(s.slot);
+                      String k = Items.keyOf(cur);
+                      if (s.type.key.equals(k) && s.ammo > 0) {
+                          Items.setAmmo(cur, s.ammo, s.type.mag);
+                          inv.setItem(s.slot, cur);
+                      }
+                  } catch (Throwable t) {
+                      getLogger().error("[Arsenal] persist: " + t, t);
+                  }
+              }
+
+              private void endSession(Session s, boolean save) {
+                  sessions.remove(s.player.getUniqueId());
+                  if (save) {
+                      persist(s);
+                  }
+              }
+
+              void release(Player p) {
+                  Session s = sessions.get(p.getUniqueId());
+                  if (s != null) {
+                      s.released = true;
+                  }
+              }
+
+              // ---------- reload ----------
+
+              private int findAmmo(Player p, String ammoKey) {
+                  for (Map.Entry<Integer, Item> en : p.getInventory().getContents().entrySet()) {
+                      if (ammoKey.equals(Items.keyOf(en.getValue()))) {
+                          return en.getKey();
+                      }
+                  }
+                  return -1;
+              }
+
+              private void reload(final Player p, final GunType t) {
+                  int tick = getServer().getTick();
+                  Integer until = reloadUntil.get(p.getUniqueId());
+                  if (until != null && tick < until) {
+                      return;
+                  }
+                  Session s = sessions.get(p.getUniqueId());
+                  if (s != null) {
+                      endSession(s, false);
+                  }
+                  if (findAmmo(p, t.ammoKey) < 0) {
+                      p.sendActionBar(msg("msg_no_ammo", "&cOut of ammo"));
+                      return;
+                  }
+                  final int heldSlot = p.getInventory().getHeldItemIndex();
+                  final int ticks = Math.max(1, (int) Math.round(t.reloadSec * 20));
+                  reloadUntil.put(p.getUniqueId(), tick + ticks);
+                  Fx.sound(p.getLevel(), p, "arsenal:" + t.reloadSound, 16, p);
+                  p.sendActionBar(msg("msg_reloading", "&7Reloading..."));
+                  getServer().getScheduler().scheduleDelayedTask(this, new Task() {
+                      @Override
+                      public void onRun(int currentTick) {
+                          try {
+                              finishReload(p, t, heldSlot);
+                          } catch (Throwable e) {
+                              getLogger().error("[Arsenal] finishReload: " + e, e);
+                          }
+                      }
+                  }, ticks);
+              }
+
+              private void finishReload(Player p, GunType t, int heldSlot) {
+                  if (!p.isOnline() || !p.isAlive()) {
+                      return;
+                  }
+                  PlayerInventory inv = p.getInventory();
+                  if (inv.getHeldItemIndex() != heldSlot) {
+                      return;
+                  }
+                  if (!(t.key + "_empty").equals(Items.keyOf(inv.getItem(heldSlot)))) {
+                      return;
+                  }
+                  int slot = findAmmo(p, t.ammoKey);
+                  if (slot < 0) {
+                      p.sendActionBar(msg("msg_no_ammo", "&cOut of ammo"));
+                      return;
+                  }
+                  if (!p.isCreative()) {
+                      Item a = inv.getItem(slot);
+                      a.setCount(a.getCount() - 1);
+                      inv.setItem(slot, a.getCount() > 0 ? a : Item.get(0));
+                  }
+                  inv.setItem(heldSlot, Items.loaded(t, t.mag));
+                  bar(p, t.mag, t.mag);
+              }
+
+              // ---------- events ----------
+
+              @EventHandler(priority = EventPriority.HIGH)
+              public void onInteract(PlayerInteractEvent e) {
+                  try {
+                      PlayerInteractEvent.Action a = e.getAction();
+                      if (a != PlayerInteractEvent.Action.RIGHT_CLICK_AIR && a != PlayerInteractEvent.Action.RIGHT_CLICK_BLOCK) {
+                          return;
+                      }
+                      Player p = e.getPlayer();
+                      Item it = e.getItem();
+                      String key = Items.keyOf(it);
+                      if (key == null) {
+                          return;
+                      }
+                      boolean empty = key.endsWith("_empty");
+                      GunType t = GunType.byKey(empty ? key.substring(0, key.length() - 6) : key);
+                      if (t == null) {
+                          return;
+                      }
+                      if (a == PlayerInteractEvent.Action.RIGHT_CLICK_BLOCK) {
+                          e.setCancelled(true);
+                      }
+                      if (p.isSpectator()) {
+                          return;
+                      }
+                      if (empty) {
+                          reload(p, t);
+                      } else {
+                          click(p, t, it, getServer().getTick());
+                      }
+                  } catch (Throwable t) {
+                      getLogger().error("[Arsenal] onInteract: " + t, t);
+                  }
+              }
+
+              @EventHandler
+              public void onHeld(PlayerItemHeldEvent e) {
+                  Session s = sessions.get(e.getPlayer().getUniqueId());
+                  if (s != null) {
+                      endSession(s, true);
+                  }
+              }
+
+              @EventHandler
+              public void onDrop(PlayerDropItemEvent e) {
+                  Session s = sessions.get(e.getPlayer().getUniqueId());
+                  if (s == null) {
+                      return;
+                  }
+                  Item d = e.getItem();
+                  String k = Items.keyOf(d);
+                  if (k != null && k.equals(s.type.key) && s.ammo > 0) {
+                      Items.setAmmo(d, s.ammo, s.type.mag);
+                  }
+                  endSession(s, false);
+              }
+
+              @EventHandler
+              public void onDeath(PlayerDeathEvent e) {
+                  Player p = e.getEntity();
+                  Session s = sessions.get(p.getUniqueId());
+                  if (s != null) {
+                      endSession(s, true);
+                  }
+                  zoomed.remove(p.getUniqueId());
+              }
+
+              @EventHandler
+              public void onQuit(PlayerQuitEvent e) {
+                  Player p = e.getPlayer();
+                  Session s = sessions.get(p.getUniqueId());
+                  if (s != null) {
+                      endSession(s, true);
+                  }
+                  if (zoomed.remove(p.getUniqueId())) {
+                      p.removeEffect(Effect.SLOWNESS);
+                  }
+                  reloadUntil.remove(p.getUniqueId());
+              }
+
+              // ---------- commands ----------
+
+              @Override
+              public boolean onCommand(CommandSender s, Command cmd, String label, String[] a) {
+                  try {
+                      if (!cmd.getName().equalsIgnoreCase("arsenal")) {
+                          return false;
+                      }
+                      if (!s.hasPermission("arsenal.give")) {
+                          s.sendMessage("\u00a7cNo permission");
+                          return true;
+                      }
+                      if (a.length < 2 || !a[0].equalsIgnoreCase("give")) {
+                          s.sendMessage("\u00a7e/arsenal give <item> [count] [player]");
+                          s.sendMessage("\u00a77guns: revolver, mac10, thompson, ump, m4a1, awm");
+                          s.sendMessage("\u00a77ammo: ammo_pistol, ammo_assault_rifle, ammo_rifle");
+                          return true;
+                      }
+                      String key = a[1].toLowerCase();
+                      if (key.equals("m4a1")) {
+                          key = "rifle_m4a1";
+                      }
+                      GunType gt = GunType.byKey(key);
+                      if (gt == null && !Items.isAmmoKey(key)) {
+                          s.sendMessage("\u00a7cUnknown item: " + a[1]);
+                          return true;
+                      }
+                      int count = 1;
+                      if (a.length >= 3) {
+                          try {
+                              count = Math.max(1, Math.min(2304, Integer.parseInt(a[2])));
+                          } catch (NumberFormatException ex) {
+                              s.sendMessage("\u00a7cBad count");
+                              return true;
+                          }
+                      }
+                      Player target = null;
+                      if (a.length >= 4) {
+                          target = getServer().getPlayer(a[3]);
+                      } else if (s instanceof Player) {
+                          target = (Player) s;
+                      }
+                      if (target == null) {
+                          s.sendMessage("\u00a7cPlayer not found");
+                          return true;
+                      }
+                      Item it = gt != null ? Items.loaded(gt, gt.mag) : Items.make(key);
+                      if (it == null) {
+                          s.sendMessage("\u00a7cCannot create item, see console");
+                          return true;
+                      }
+                      it.setCount(count);
+                      Item[] left = target.getInventory().addItem(it);
+                      for (Item l : left) {
+                          target.getLevel().dropItem(target, l);
+                      }
+                      s.sendMessage("\u00a7aGiven " + count + "x " + Items.display(key) + " -> " + target.getName());
+                      return true;
+                  } catch (Throwable t) {
+                      s.sendMessage("\u00a7cError, see server console");
+                      getLogger().error("[Arsenal] command: " + t, t);
+                      return true;
+                  }
+              }
+          }
+          ARS_EOF
+
+      - name: Build
+        run: mvn -B clean package -f ArsenalPlugin/pom.xml
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Arsenal-jar
+          path: ArsenalPlugin/target/Arsenal.jar
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ArsenalRP
+          path: out/ArsenalRP.zip
